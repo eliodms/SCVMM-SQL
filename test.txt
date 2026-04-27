@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [string[]]$HyperVClusters = @('AZURE-HC-03','AZURE-HC-05','AZURE-HC-06'),
-    [string[]]$SofsClusters   = @('AZURE-FS-03','AZURE-FS-09','AZURE-FS-10'),
+    [string[]]$HyperVClusters = @('XXXXX-HC-03','XXXXX-HC-05','XXXXX-HC-06'),
+    [string[]]$SofsClusters   = @('XXXXX-FS-03','XXXXX-FS-09','XXXXX-FS-10'),
     [string]$OutputRoot = ".\\HyperV-SecureBoot-Inventory",
     [switch]$IncludeStandaloneVmsOnHosts
 )
