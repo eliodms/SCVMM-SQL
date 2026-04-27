@@ -112,3 +112,14 @@ let
 in
     AddGuestOSFamily
 
+ERRORS
+======
+
+let
+    Source = Csv.Document(
+        File.Contents("\\AZURE-FS-LIB\\Workspaces\\Scripts\\Secure-Boot\\HyperV-SecureBoot-Inventory\\20260427-103500\\Errors.csv"),
+        [Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.Csv]
+    ),
+    PromoteHeaders = Table.PromoteHeaders(Source, [PromoteAllScalars=true])
+in
+
