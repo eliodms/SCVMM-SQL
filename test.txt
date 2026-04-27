@@ -123,3 +123,119 @@ let
     PromoteHeaders = Table.PromoteHeaders(Source, [PromoteAllScalars=true])
 in
 
+function Get-ClusteredVmInventory {
+    param([Parameter(Mandatory)][string]$ClusterName)
+
+    $vmRows = New-Object System.Collections.Generic.List[object]
+    $seenVmIds = [System.Collections.Generic.HashSet[string]]::new()
+
+    $nodes = Get-ClusterNode -Cluster $ClusterName
+
+    foreach ($node in $nodes) {
+
+        $hostVms = $null
+        try {
+            $hostVms = @(Hyper-V\Get-VM -ComputerName $node.Name -ErrorAction Stop)
+        }
+        catch {
+            $vmRows.Add([pscustomobject]@{
+                HyperVCluster               = $ClusterName
+                VMName                      = $null
+                CurrentOwnerNode            = $node.Name
+                VMState                     = $null
+                Generation                  = $null
+                ConfigurationVersion        = $null
+                DynamicMemoryEnabled        = $null
+                ProcessorCount              = $null
+                MemoryAssignedMB            = $null
+                VMSecureBootApplicable      = $null
+                VMSecureBootEnabled         = $null
+                VMSecureBootTemplate        = $null
+                GuestOS                     = $null
+                GuestOSDetail               = $null
+                GuestOSSource               = $null
+                GuestOSError                = $null
+                InventoryError              = "Failed to enumerate VMs on host '$($node.Name)': $($_.Exception.Message)"
+            }) | Out-Null
+            continue
+        }
+
+        foreach ($vm in $hostVms) {
+
+            # Deduplicate by VM Id so the same VM is not written twice
+            $vmId = [string]$vm.Id
+            if ([string]::IsNullOrWhiteSpace($vmId) -eq $false) {
+                if ($seenVmIds.Contains($vmId)) {
+                    continue
+                }
+                [void]$seenVmIds.Add($vmId)
+            }
+
+            # If you want to exclude standalone VMs unless the switch is set,
+            # uncomment the next 3 lines.
+            # if (-not $IncludeStandaloneVmsOnHosts -and $vm.IsClustered -ne $true) {
+            #     continue
+            # }
+
+            $firmware = $null
+            $vmSecureBootApplicable = $false
+            $vmSecureBootEnabled = $null
+            $vmSecureBootTemplate = $null
+            $inventoryError = $null
+
+            if ($vm.Generation -eq 2) {
+                $vmSecureBootApplicable = $true
+                try {
+                    $firmware = Hyper-V\Get-VMFirmware -VM $vm -ErrorAction Stop
+                    $vmSecureBootEnabled = [bool]$firmware.SecureBoot
+                    $vmSecureBootTemplate = $firmware.SecureBootTemplate
+                }
+                catch {
+                    $inventoryError = "Get-VMFirmware failed: $($_.Exception.Message)"
+                }
+            }
+
+            $guestOs = $null
+            $guestOsDetail = $null
+            $guestOsSource = $null
+            $guestOsError = $null
+
+            if ($vm.State -eq 'Running') {
+                $guest = Get-VMGuestOsFromKvp -VmName $vm.Name -ComputerName $vm.ComputerName
+                $guestOs = $guest.GuestOS
+                $guestOsDetail = $guest.GuestOSDetail
+                $guestOsSource = $guest.Source
+                $guestOsError = $guest.Error
+            }
+            else {
+                $guestOsSource = 'Unavailable'
+                $guestOsDetail = 'VM not running'
+            }
+
+            $vmRows.Add([pscustomobject]@{
+                HyperVCluster               = $ClusterName
+                VMName                      = $vm.Name
+                CurrentOwnerNode            = $node.Name
+                VMState                     = [string]$vm.State
+                Generation                  = $vm.Generation
+                ConfigurationVersion        = $vm.Version
+                DynamicMemoryEnabled        = $vm.DynamicMemoryEnabled
+                ProcessorCount              = $vm.ProcessorCount
+                MemoryAssignedMB            = if ($vm.MemoryAssigned) { [math]::Round($vm.MemoryAssigned / 1MB, 0) } else { $null }
+                VMSecureBootApplicable      = $vmSecureBootApplicable
+                VMSecureBootEnabled         = $vmSecureBootEnabled
+                VMSecureBootTemplate        = $vmSecureBootTemplate
+                GuestOS                     = $guestOs
+                GuestOSDetail               = $guestOsDetail
+                GuestOSSource               = $guestOsSource
+                GuestOSError                = $guestOsError
+                InventoryError              = $inventoryError
+            }) | Out-Null
+        }
+    }
+
+    return $vmRows
+}
+
+
+
