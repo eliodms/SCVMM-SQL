@@ -1,68 +1,16 @@
+LatestInventoryFolder
+
 let
-    Source = Csv.Document(
-        File.Contents("\\AZURE-FS-LIB\\Workspaces\\Scripts\\Secure-Boot\\HyperV-SecureBoot-Inventory\\20260427-103500\\VMs.csv"),
-        [Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.Csv]
+    Source = Folder.Files("\\AZURE-FS-LIB\\Workspaces\\Scripts\\Secure-Boot\\HyperV-SecureBoot-Inventory"),
+    KeepRelevant = Table.SelectColumns(Source, {"Folder Path", "Name", "Date modified", "Content"}),
+    FilterCsv = Table.SelectRows(KeepRelevant, each [Extension]? <> null or true),
+    SplitFolder = Table.AddColumn(FilterCsv, "RunFolder", each List.Last(Text.Split(Text.TrimEnd([Folder Path], "\\"), "\\")), type text),
+    GroupByRunFolder = Table.Group(
+        SplitFolder,
+        {"RunFolder", "Folder Path"},
+        {{"LatestModified", each List.Max([Date modified]), type datetime}}
     ),
-    PromoteHeaders = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),
-    ChangeTypes = Table.TransformColumnTypes(
-        PromoteHeaders,
-        {
-            {"HyperVCluster", type text},
-            {"VMName", type text},
-            {"CurrentOwnerNode", type text},
-            {"VMState", type text},
-            {"Generation", Int64.Type},
-            {"ConfigurationVersion", type text},
-            {"DynamicMemoryEnabled", type logical},
-            {"ProcessorCount", Int64.Type},
-            {"MemoryAssignedMB", Int64.Type},
-            {"VMSecureBootApplicable", type logical},
-            {"VMSecureBootEnabled", type logical},
-            {"VMSecureBootTemplate", type text},
-            {"GuestOS", type text},
-            {"GuestOSDetail", type text},
-            {"GuestOSSource", type text},
-            {"GuestOSError", type text},
-            {"InventoryError", type text}
-        }
-    ),
-    AddVM_SecureBoot_State = Table.AddColumn(
-        ChangeTypes,
-        "VM_SecureBoot_State",
-        each
-            if [Generation] = 1 then "Gen1 / N/A"
-            else if [Generation] = 2 and [VMSecureBootEnabled] = true then "Gen2 - Enabled"
-            else if [Generation] = 2 and [VMSecureBootEnabled] = false then "Gen2 - Disabled"
-            else "Unknown",
-        type text
-    ),
-    AddJuneActionRequired = Table.AddColumn(
-        AddVM_SecureBoot_State,
-        "JuneActionRequired",
-        each
-            if [Generation] = 2 and [VMSecureBootEnabled] = true then "Yes - Gen2 Secure Boot Enabled"
-            else if [Generation] = 2 and [VMSecureBootEnabled] = false then "Review - Gen2 Secure Boot Disabled"
-            else if [Generation] = 1 then "No - Gen1 / Not Applicable"
-            else "Review - Missing Data",
-        type text
-    ),
-    AddGuestOSFamily = Table.AddColumn(
-        AddJuneActionRequired,
-        "GuestOSFamily",
-        each
-            if [GuestOS] = null or Text.Trim([GuestOS]) = "" then "Unknown"
-            else if Text.Contains(Text.Lower([GuestOS]), "windows server") then "Windows Server"
-            else if Text.Contains(Text.Lower([GuestOS]), "windows 11") or Text.Contains(Text.Lower([GuestOS]), "windows 10") then "Windows Client"
-            else if Text.Contains(Text.Lower([GuestOS]), "ubuntu")
-              or Text.Contains(Text.Lower([GuestOS]), "red hat")
-              or Text.Contains(Text.Lower([GuestOS]), "rhel")
-              or Text.Contains(Text.Lower([GuestOS]), "centos")
-              or Text.Contains(Text.Lower([GuestOS]), "suse")
-              or Text.Contains(Text.Lower([GuestOS]), "debian")
-              or Text.Contains(Text.Lower([GuestOS]), "linux") then "Linux"
-            else "Other",
-        type text
-    )
+    SortDesc = Table.Sort(GroupByRunFolder, {{"RunFolder", Order.Descending}}),
+    KeepTop = Table.FirstN(SortDesc, 1)
 in
-    AddGuestOSFamily
-``
+    KeepTop
