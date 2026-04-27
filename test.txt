@@ -1,404 +1,68 @@
-[CmdletBinding()]
-param(
-    [string[]]$HyperVClusters = @('XXXXX-HC-03','XXXXX-HC-05','XXXXX-HC-06'),
-    [string[]]$SofsClusters   = @('XXXXX-FS-03','XXXXX-FS-09','XXXXX-FS-10'),
-    [string]$OutputRoot = ".\\HyperV-SecureBoot-Inventory",
-    [switch]$IncludeStandaloneVmsOnHosts
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-
-function Ensure-Module {
-    param([Parameter(Mandatory)][string]$Name)
-    if (-not (Get-Module -ListAvailable -Name $Name)) {
-        throw "Required module '$Name' is not available on this system."
-    }
-    Import-Module $Name -ErrorAction Stop | Out-Null
-}
-
-function New-OutputFolder {
-    param([string]$Root)
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $path = Join-Path -Path $Root -ChildPath $stamp
-    New-Item -Path $path -ItemType Directory -Force | Out-Null
-    return $path
-}
-
-function Get-RemotePhysicalInventory {
-    param(
-        [Parameter(Mandatory)][string]$ComputerName,
-        [Parameter(Mandatory)][string]$Role,
-        [Parameter(Mandatory)][string]$SourceCluster
+let
+    Source = Csv.Document(
+        File.Contents("\\AZURE-FS-LIB\\Workspaces\\Scripts\\Secure-Boot\\HyperV-SecureBoot-Inventory\\20260427-103500\\VMs.csv"),
+        [Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.Csv]
+    ),
+    PromoteHeaders = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),
+    ChangeTypes = Table.TransformColumnTypes(
+        PromoteHeaders,
+        {
+            {"HyperVCluster", type text},
+            {"VMName", type text},
+            {"CurrentOwnerNode", type text},
+            {"VMState", type text},
+            {"Generation", Int64.Type},
+            {"ConfigurationVersion", type text},
+            {"DynamicMemoryEnabled", type logical},
+            {"ProcessorCount", Int64.Type},
+            {"MemoryAssignedMB", Int64.Type},
+            {"VMSecureBootApplicable", type logical},
+            {"VMSecureBootEnabled", type logical},
+            {"VMSecureBootTemplate", type text},
+            {"GuestOS", type text},
+            {"GuestOSDetail", type text},
+            {"GuestOSSource", type text},
+            {"GuestOSError", type text},
+            {"InventoryError", type text}
+        }
+    ),
+    AddVM_SecureBoot_State = Table.AddColumn(
+        ChangeTypes,
+        "VM_SecureBoot_State",
+        each
+            if [Generation] = 1 then "Gen1 / N/A"
+            else if [Generation] = 2 and [VMSecureBootEnabled] = true then "Gen2 - Enabled"
+            else if [Generation] = 2 and [VMSecureBootEnabled] = false then "Gen2 - Disabled"
+            else "Unknown",
+        type text
+    ),
+    AddJuneActionRequired = Table.AddColumn(
+        AddVM_SecureBoot_State,
+        "JuneActionRequired",
+        each
+            if [Generation] = 2 and [VMSecureBootEnabled] = true then "Yes - Gen2 Secure Boot Enabled"
+            else if [Generation] = 2 and [VMSecureBootEnabled] = false then "Review - Gen2 Secure Boot Disabled"
+            else if [Generation] = 1 then "No - Gen1 / Not Applicable"
+            else "Review - Missing Data",
+        type text
+    ),
+    AddGuestOSFamily = Table.AddColumn(
+        AddJuneActionRequired,
+        "GuestOSFamily",
+        each
+            if [GuestOS] = null or Text.Trim([GuestOS]) = "" then "Unknown"
+            else if Text.Contains(Text.Lower([GuestOS]), "windows server") then "Windows Server"
+            else if Text.Contains(Text.Lower([GuestOS]), "windows 11") or Text.Contains(Text.Lower([GuestOS]), "windows 10") then "Windows Client"
+            else if Text.Contains(Text.Lower([GuestOS]), "ubuntu")
+              or Text.Contains(Text.Lower([GuestOS]), "red hat")
+              or Text.Contains(Text.Lower([GuestOS]), "rhel")
+              or Text.Contains(Text.Lower([GuestOS]), "centos")
+              or Text.Contains(Text.Lower([GuestOS]), "suse")
+              or Text.Contains(Text.Lower([GuestOS]), "debian")
+              or Text.Contains(Text.Lower([GuestOS]), "linux") then "Linux"
+            else "Other",
+        type text
     )
-
-    $result = [ordered]@{
-        Role                      = $Role
-        SourceCluster             = $SourceCluster
-        ComputerName              = $ComputerName
-        Reachable                 = $false
-        SupportsSecureBoot        = $null
-        PhysicalSecureBootEnabled = $null
-        PhysicalSecureBootRaw     = $null
-        Manufacturer              = $null
-        Model                     = $null
-        SystemType                = $null
-        OSCaption                 = $null
-        OSVersion                 = $null
-        OSBuildNumber             = $null
-        BIOSVersion               = $null
-        SerialNumber              = $null
-        LastBootUpTime            = $null
-        CollectionError           = $null
-    }
-
-    try {
-        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $ComputerName
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName
-        $bios = Get-CimInstance -ClassName Win32_BIOS -ComputerName $ComputerName
-
-        $result.Reachable      = $true
-        $result.Manufacturer   = $cs.Manufacturer
-        $result.Model          = $cs.Model
-        $result.SystemType     = $cs.SystemType
-        $result.OSCaption      = $os.Caption
-        $result.OSVersion      = $os.Version
-        $result.OSBuildNumber  = $os.BuildNumber
-        $result.BIOSVersion    = ($bios.SMBIOSBIOSVersion -join '; ')
-        $result.SerialNumber   = $bios.SerialNumber
-        $result.LastBootUpTime = $os.LastBootUpTime
-
-        try {
-            $sb = Invoke-Command -ComputerName $ComputerName -ScriptBlock {
-                try {
-                    $value = Confirm-SecureBootUEFI
-                    [pscustomobject]@{
-                        SupportsSecureBoot = $true
-                        PhysicalSecureBootEnabled = [bool]$value
-                        PhysicalSecureBootRaw = [string]$value
-                    }
-                }
-                catch {
-                    $msg = $_.Exception.Message
-                    if ($msg -match 'Cmdlet not supported on this platform') {
-                        [pscustomobject]@{
-                            SupportsSecureBoot = $false
-                            PhysicalSecureBootEnabled = $null
-                            PhysicalSecureBootRaw = 'UnsupportedOrLegacy'
-                        }
-                    }
-                    else {
-                        throw
-                    }
-                }
-            } -ErrorAction Stop
-
-            $result.SupportsSecureBoot        = $sb.SupportsSecureBoot
-            $result.PhysicalSecureBootEnabled = $sb.PhysicalSecureBootEnabled
-            $result.PhysicalSecureBootRaw     = $sb.PhysicalSecureBootRaw
-        }
-        catch {
-            $result.SupportsSecureBoot        = $null
-            $result.PhysicalSecureBootEnabled = $null
-            $result.PhysicalSecureBootRaw     = "Error: $($_.Exception.Message)"
-        }
-    }
-    catch {
-        $result.CollectionError = $_.Exception.Message
-    }
-
-    [pscustomobject]$result
-}
-
-function Get-VMGuestOsFromKvp {
-    param(
-        [Parameter(Mandatory)][string]$VmName,
-        [Parameter(Mandatory)][string]$ComputerName
-    )
-
-    try {
-        $escapedVmName = $VmName.Replace("'", "''")
-        $vmCim = Get-CimInstance -Namespace root/virtualization/v2 -Query "SELECT * FROM Msvm_ComputerSystem WHERE ElementName='$escapedVmName'" -ComputerName $ComputerName -ErrorAction Stop
-        if (-not $vmCim) {
-            return [pscustomobject]@{ GuestOS = $null; GuestOSDetail = 'VM object not found in virtualization namespace'; Source = 'KVP'; Error = $null }
-        }
-
-        $kvp = Get-CimAssociatedInstance -InputObject $vmCim -ResultClassName Msvm_KvpExchangeComponent -ErrorAction Stop
-        $items = @($kvp.GuestIntrinsicExchangeItems)
-        if (-not $items -or $items.Count -eq 0) {
-            return [pscustomobject]@{ GuestOS = $null; GuestOSDetail = 'No guest intrinsic exchange items'; Source = 'KVP'; Error = $null }
-        }
-
-        $records = foreach ($item in $items) {
-            try {
-                $xml = [xml]$item
-                $nameNode = $xml.INSTANCE.PROPERTY | Where-Object { $_.NAME -eq 'Name' }
-                $dataNode = $xml.INSTANCE.PROPERTY | Where-Object { $_.NAME -eq 'Data' }
-                if ($nameNode -and $dataNode) {
-                    [pscustomobject]@{
-                        Name = $nameNode.VALUE
-                        Data = $dataNode.VALUE
-                    }
-                }
-            }
-            catch {
-            }
-        }
-
-        $osName = ($records | Where-Object { $_.Name -eq 'OSName' } | Select-Object -ExpandProperty Data -First 1)
-        $osVersion = ($records | Where-Object { $_.Name -eq 'OSVersion' } | Select-Object -ExpandProperty Data -First 1)
-
-        if ($osName) {
-            return [pscustomobject]@{ GuestOS = $osName; GuestOSDetail = $osVersion; Source = 'KVP'; Error = $null }
-        }
-        else {
-            return [pscustomobject]@{ GuestOS = $null; GuestOSDetail = 'OSName not reported by KVP'; Source = 'KVP'; Error = $null }
-        }
-    }
-    catch {
-        return [pscustomobject]@{ GuestOS = $null; GuestOSDetail = $null; Source = 'KVP'; Error = $_.Exception.Message }
-    }
-}
-
-function Get-ClusteredVmInventory {
-    param([Parameter(Mandatory)][string]$ClusterName)
-
-    $vmRows = New-Object System.Collections.Generic.List[object]
-
-    $clusterGroups = Get-ClusterGroup -Cluster $ClusterName | Where-Object { $_.GroupType -eq 'VirtualMachine' }
-    foreach ($group in $clusterGroups) {
-        $vm = $null
-        try {
-            $vm = $group | Get-VM
-        }
-        catch {
-            $vmRows.Add([pscustomobject]@{
-                HyperVCluster               = $ClusterName
-                VMName                      = $group.Name
-                CurrentOwnerNode            = $group.OwnerNode.Name
-                VMState                     = $null
-                Generation                  = $null
-                ConfigurationVersion        = $null
-                DynamicMemoryEnabled        = $null
-                ProcessorCount              = $null
-                MemoryAssignedMB            = $null
-                VMSecureBootApplicable      = $null
-                VMSecureBootEnabled         = $null
-                VMSecureBootTemplate        = $null
-                GuestOS                     = $null
-                GuestOSDetail               = $null
-                GuestOSSource               = $null
-                GuestOSError                = $_.Exception.Message
-                InventoryError              = "Failed to read VM object from clustered group"
-            }) | Out-Null
-            continue
-        }
-
-        $firmware = $null
-        $vmSecureBootApplicable = $false
-        $vmSecureBootEnabled = $null
-        $vmSecureBootTemplate = $null
-        $inventoryError = $null
-
-        if ($vm.Generation -eq 2) {
-            $vmSecureBootApplicable = $true
-            try {
-                $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
-                $vmSecureBootEnabled = [bool]$firmware.SecureBoot
-                $vmSecureBootTemplate = $firmware.SecureBootTemplate
-            }
-            catch {
-                $inventoryError = "Get-VMFirmware failed: $($_.Exception.Message)"
-            }
-        }
-
-        $guestOs = $null
-        $guestOsDetail = $null
-        $guestOsSource = $null
-        $guestOsError = $null
-
-        if ($vm.State -eq 'Running') {
-            $guest = Get-VMGuestOsFromKvp -VmName $vm.Name -ComputerName $vm.ComputerName
-            $guestOs = $guest.GuestOS
-            $guestOsDetail = $guest.GuestOSDetail
-            $guestOsSource = $guest.Source
-            $guestOsError = $guest.Error
-        }
-        else {
-            $guestOsSource = 'Unavailable'
-            $guestOsDetail = 'VM not running'
-        }
-
-        $vmRows.Add([pscustomobject]@{
-            HyperVCluster               = $ClusterName
-            VMName                      = $vm.Name
-            CurrentOwnerNode            = $group.OwnerNode.Name
-            VMState                     = [string]$vm.State
-            Generation                  = $vm.Generation
-            ConfigurationVersion        = $vm.Version
-            DynamicMemoryEnabled        = $vm.DynamicMemoryEnabled
-            ProcessorCount              = $vm.ProcessorCount
-            MemoryAssignedMB            = if ($vm.MemoryAssigned) { [math]::Round($vm.MemoryAssigned / 1MB, 0) } else { $null }
-            VMSecureBootApplicable      = $vmSecureBootApplicable
-            VMSecureBootEnabled         = $vmSecureBootEnabled
-            VMSecureBootTemplate        = $vmSecureBootTemplate
-            GuestOS                     = $guestOs
-            GuestOSDetail               = $guestOsDetail
-            GuestOSSource               = $guestOsSource
-            GuestOSError                = $guestOsError
-            InventoryError              = $inventoryError
-        }) | Out-Null
-    }
-
-    if ($IncludeStandaloneVmsOnHosts) {
-        $nodes = Get-ClusterNode -Cluster $ClusterName
-        foreach ($node in $nodes) {
-            $standalone = @(Get-VM -ComputerName $node.Name | Where-Object { $_.IsClustered -ne $true })
-            foreach ($vm in $standalone) {
-                $firmware = $null
-                $vmSecureBootApplicable = $false
-                $vmSecureBootEnabled = $null
-                $vmSecureBootTemplate = $null
-                $inventoryError = $null
-
-                if ($vm.Generation -eq 2) {
-                    $vmSecureBootApplicable = $true
-                    try {
-                        $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
-                        $vmSecureBootEnabled = [bool]$firmware.SecureBoot
-                        $vmSecureBootTemplate = $firmware.SecureBootTemplate
-                    }
-                    catch {
-                        $inventoryError = "Get-VMFirmware failed: $($_.Exception.Message)"
-                    }
-                }
-
-                $guestOs = $null
-                $guestOsDetail = $null
-                $guestOsSource = $null
-                $guestOsError = $null
-                if ($vm.State -eq 'Running') {
-                    $guest = Get-VMGuestOsFromKvp -VmName $vm.Name -ComputerName $vm.ComputerName
-                    $guestOs = $guest.GuestOS
-                    $guestOsDetail = $guest.GuestOSDetail
-                    $guestOsSource = $guest.Source
-                    $guestOsError = $guest.Error
-                }
-                else {
-                    $guestOsSource = 'Unavailable'
-                    $guestOsDetail = 'VM not running'
-                }
-
-                $vmRows.Add([pscustomobject]@{
-                    HyperVCluster               = $ClusterName
-                    VMName                      = $vm.Name
-                    CurrentOwnerNode            = $node.Name
-                    VMState                     = [string]$vm.State
-                    Generation                  = $vm.Generation
-                    ConfigurationVersion        = $vm.Version
-                    DynamicMemoryEnabled        = $vm.DynamicMemoryEnabled
-                    ProcessorCount              = $vm.ProcessorCount
-                    MemoryAssignedMB            = if ($vm.MemoryAssigned) { [math]::Round($vm.MemoryAssigned / 1MB, 0) } else { $null }
-                    VMSecureBootApplicable      = $vmSecureBootApplicable
-                    VMSecureBootEnabled         = $vmSecureBootEnabled
-                    VMSecureBootTemplate        = $vmSecureBootTemplate
-                    GuestOS                     = $guestOs
-                    GuestOSDetail               = $guestOsDetail
-                    GuestOSSource               = $guestOsSource
-                    GuestOSError                = $guestOsError
-                    InventoryError              = $inventoryError
-                }) | Out-Null
-            }
-        }
-    }
-
-    return $vmRows
-}
-
-Ensure-Module -Name FailoverClusters
-Ensure-Module -Name Hyper-V
-Ensure-Module -Name CimCmdlets
-
-$outputFolder = New-OutputFolder -Root $OutputRoot
-$physicalRows = New-Object System.Collections.Generic.List[object]
-$vmRows = New-Object System.Collections.Generic.List[object]
-$errors = New-Object System.Collections.Generic.List[object]
-
-foreach ($cluster in $HyperVClusters) {
-    try {
-        $nodes = Get-ClusterNode -Cluster $cluster
-        foreach ($node in $nodes) {
-            $physicalRows.Add((Get-RemotePhysicalInventory -ComputerName $node.Name -Role 'HyperVNode' -SourceCluster $cluster)) | Out-Null
-        }
-
-        foreach ($vmRow in (Get-ClusteredVmInventory -ClusterName $cluster)) {
-            $vmRows.Add($vmRow) | Out-Null
-        }
-    }
-    catch {
-        $errors.Add([pscustomobject]@{
-            Scope = 'HyperVCluster'
-            Name  = $cluster
-            Error = $_.Exception.Message
-        }) | Out-Null
-    }
-}
-
-foreach ($cluster in $SofsClusters) {
-    try {
-        $nodes = Get-ClusterNode -Cluster $cluster
-        foreach ($node in $nodes) {
-            $physicalRows.Add((Get-RemotePhysicalInventory -ComputerName $node.Name -Role 'SOFSNode' -SourceCluster $cluster)) | Out-Null
-        }
-    }
-    catch {
-        $errors.Add([pscustomobject]@{
-            Scope = 'SOFSCluster'
-            Name  = $cluster
-            Error = $_.Exception.Message
-        }) | Out-Null
-    }
-}
-
-$physicalPath = Join-Path $outputFolder 'PhysicalServers.csv'
-$vmPath       = Join-Path $outputFolder 'VMs.csv'
-$errorPath    = Join-Path $outputFolder 'Errors.csv'
-$summaryPath  = Join-Path $outputFolder 'Summary.txt'
-
-$physicalRows | Sort-Object Role, SourceCluster, ComputerName | Export-Csv -Path $physicalPath -NoTypeInformation -Encoding UTF8
-$vmRows       | Sort-Object HyperVCluster, VMName             | Export-Csv -Path $vmPath -NoTypeInformation -Encoding UTF8
-$errors       | Export-Csv -Path $errorPath -NoTypeInformation -Encoding UTF8
-
-$sb = New-Object System.Text.StringBuilder
-[void]$sb.AppendLine("Inventory completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-[void]$sb.AppendLine("Output folder: $outputFolder")
-[void]$sb.AppendLine("")
-[void]$sb.AppendLine("Physical inventory summary")
-[void]$sb.AppendLine("--------------------------")
-[void]$sb.AppendLine("Total physical nodes: $($physicalRows.Count)")
-[void]$sb.AppendLine("Physical Secure Boot = True : $((@($physicalRows | Where-Object { $_.PhysicalSecureBootEnabled -eq $true })).Count)")
-[void]$sb.AppendLine("Physical Secure Boot = False: $((@($physicalRows | Where-Object { $_.PhysicalSecureBootEnabled -eq $false })).Count)")
-[void]$sb.AppendLine("Physical Secure Boot Unknown: $((@($physicalRows | Where-Object { $null -eq $_.PhysicalSecureBootEnabled })).Count)")
-[void]$sb.AppendLine("")
-[void]$sb.AppendLine("VM inventory summary")
-[void]$sb.AppendLine("--------------------")
-[void]$sb.AppendLine("Total VMs inventoried: $($vmRows.Count)")
-[void]$sb.AppendLine("Gen2 VMs with Secure Boot enabled : $((@($vmRows | Where-Object { $_.VMSecureBootApplicable -eq $true -and $_.VMSecureBootEnabled -eq $true })).Count)")
-[void]$sb.AppendLine("Gen2 VMs with Secure Boot disabled: $((@($vmRows | Where-Object { $_.VMSecureBootApplicable -eq $true -and $_.VMSecureBootEnabled -eq $false })).Count)")
-[void]$sb.AppendLine("Gen1 / not applicable             : $((@($vmRows | Where-Object { $_.VMSecureBootApplicable -eq $false })).Count)")
-[void]$sb.AppendLine("")
-[void]$sb.AppendLine("Files")
-[void]$sb.AppendLine("-----")
-[void]$sb.AppendLine("- $physicalPath")
-[void]$sb.AppendLine("- $vmPath")
-[void]$sb.AppendLine("- $errorPath")
-
-$sb.ToString() | Set-Content -Path $summaryPath -Encoding UTF8
-
-Write-Host "Inventory completed successfully." -ForegroundColor Green
-Write-Host "Output folder: $outputFolder"
-Write-Host "Physical CSV : $physicalPath"
-Write-Host "VM CSV       : $vmPath"
-Write-Host "Errors CSV   : $errorPath"
-Write-Host "Summary      : $summaryPath"
-
+in
+    AddGuestOSFamily
+``
