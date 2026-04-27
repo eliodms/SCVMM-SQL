@@ -1,16 +1,40 @@
-LatestInventoryFolder
-
 let
-    Source = Folder.Files("\\AZURE-FS-LIB\\Workspaces\\Scripts\\Secure-Boot\\HyperV-SecureBoot-Inventory"),
-    KeepRelevant = Table.SelectColumns(Source, {"Folder Path", "Name", "Date modified", "Content"}),
-    FilterCsv = Table.SelectRows(KeepRelevant, each [Extension]? <> null or true),
-    SplitFolder = Table.AddColumn(FilterCsv, "RunFolder", each List.Last(Text.Split(Text.TrimEnd([Folder Path], "\\"), "\\")), type text),
-    GroupByRunFolder = Table.Group(
-        SplitFolder,
-        {"RunFolder", "Folder Path"},
-        {{"LatestModified", each List.Max([Date modified]), type datetime}}
+    Source = Csv.Document(
+        File.Contents("\\AZURE-FS-LIB\\Workspaces\\Scripts\\Secure-Boot\\HyperV-SecureBoot-Inventory\\20260427-103500\\PhysicalServers.csv"),
+        [Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.Csv]
     ),
-    SortDesc = Table.Sort(GroupByRunFolder, {{"RunFolder", Order.Descending}}),
-    KeepTop = Table.FirstN(SortDesc, 1)
+    PromoteHeaders = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),
+    ChangeTypes = Table.TransformColumnTypes(
+        PromoteHeaders,
+        {
+            {"Role", type text},
+            {"SourceCluster", type text},
+            {"ComputerName", type text},
+            {"Reachable", type logical},
+            {"SupportsSecureBoot", type logical},
+            {"PhysicalSecureBootEnabled", type logical},
+            {"PhysicalSecureBootRaw", type text},
+            {"Manufacturer", type text},
+            {"Model", type text},
+            {"SystemType", type text},
+            {"OSCaption", type text},
+            {"OSVersion", type text},
+            {"OSBuildNumber", type text},
+            {"BIOSVersion", type text},
+            {"SerialNumber", type text},
+            {"LastBootUpTime", type datetime},
+            {"CollectionError", type text}
+        }
+    ),
+    AddPhysicalSecureBootState = Table.AddColumn(
+        ChangeTypes,
+        "PhysicalSecureBootState",
+        each
+            if [PhysicalSecureBootEnabled] = true then "Enabled"
+            else if [PhysicalSecureBootEnabled] = false then "Disabled"
+            else "Unknown / Unsupported",
+        type text
+    )
 in
-    KeepTop
+    AddPhysicalSecureBootState
+``
