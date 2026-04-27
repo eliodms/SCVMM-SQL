@@ -239,3 +239,17 @@ function Get-ClusteredVmInventory {
 
 
 
+
+if ($vm.Generation -eq 2) {
+    $vmSecureBootApplicable = $true
+    try {
+        $firmware = Hyper-V\Get-VMFirmware -ComputerName $node.Name -VMName $vm.Name -ErrorAction Stop
+        $vmSecureBootEnabled  = [bool]$firmware.SecureBoot
+        $vmSecureBootTemplate = $firmware.SecureBootTemplate
+    }
+    catch {
+        $inventoryError = "Get-VMFirmware failed on $($node.Name) for $($vm.Name): $($_.Exception.Message)"
+    }
+}
+
+
